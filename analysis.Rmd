@@ -1,0 +1,1634 @@
+---
+title: 'Gender and authorship in Annals of Surgery: A fourteen year review'
+author: "Marcello Chang, Jane W. Liang, Sharon Stein, and Arghavan Salles"
+date: "2023-02-15"
+output:
+  html_document:
+    df_print: paged
+  pdf_document: default
+---
+
+```{r, message = FALSE}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE)
+
+# Data wrangling
+library(tidyverse)
+library(lubridate)
+
+# Plotting
+library(reshape2)
+library(forcats)
+library(ggrepel)
+library(gridExtra)
+
+# Robust SEs
+library(sandwich)
+library(lmtest) 
+
+# Marginal means
+library(emmeans)
+
+# Set background to be white for all ggplots
+theme_set(theme_classic())
+```
+
+# Data pre-processing
+
+The data read in below is pulled from `annals_surg?figs_June_25_0_9.ipynb`. We performed some minor data pre-processing to get it R-ready. 
+
+```{r}
+# Read in data (includes grants)
+load("../new_data/new_data.rData")
+df_original = article_df
+
+# Set blank genders to NA and convert to factor
+df_original$first_author_gender[df_original$first_author_gender == ""] = NA
+df_original$first_author_gender = factor(df_original$first_author_gender, 
+                                         levels = c("male", "female"), 
+                                         labels = c("Man", "Woman"))
+df_original$last_author_gender[df_original$last_author_gender == ""] = NA
+df_original$last_author_gender = factor(df_original$last_author_gender, 
+                                         levels = c("male", "female"), 
+                                         labels = c("Man", "Woman"))
+
+# Create a variable to indicate that all articles were submitted
+df_original$submitted = 1
+# Pandemic defined as on or after March 24, 2023
+# Also create cutpoint for unknown speculated editorial process change that 
+# greatly reduces time to decision. Unclear exactly where it should be, but 
+# change may have occurred as early as 2013
+df_original = df_original %>% 
+  mutate(time_periods = factor(case_when(
+    # Pre-pandemic, before discontinuity
+    first_receipt_date < as.Date("2014-01-01") ~ "1", 
+    # Pre-pandemic, after discontinuity
+    first_receipt_date >= as.Date("2014-01-01") & 
+      first_receipt_date < as.Date("2020-03-24") ~ "2",
+    # Pandemic
+    first_receipt_date >= as.Date("2020-03-24") ~ "3")))
+```
+
+We used string processing on the author names to make it easier to match the same author to him/herself: 
+
+1. Trim white space
+2. Attempt to remove degrees and suffixes at the end of the name (everything after the comma)
+3. Attempt to remove middle initials by removing everything between the first name (characters that come after the first white space) and the last name (characters that come before the last white space)
+4. Make everything lowercase, so that the names are not case-sensitive
+
+```{r}
+# Remove white space in author names and convert to factor
+# Do some string processing (remove degrees, middle initials, case) to help 
+# match the same author by name
+df_original$first_author = 
+  as.factor(tolower(sapply(strsplit(gsub("(.*),.*", "\\1", 
+                                         trimws(df_original$first_author)), 
+                                    split = " +"), function(x){
+                                      paste(x[1], x[length(x)])
+                                    })))
+df_original$last_author = 
+  as.factor(tolower(sapply(strsplit(gsub("(.*),.*", "\\1", 
+                                         trimws(df_original$last_author)), 
+                                    split = " +"), function(x){
+                                      paste(x[1], x[length(x)])
+                                    })))
+```
+
+# Authors with multiple manuscripts
+
+One challenging aspect for analyzing this dataset is the fact that the same author can submit multiple manuscripts to the journal. Unique authors are identified based on name, so if the same person publishes under different names or multiple authors have the same name in this dataset, we may not pick up on that. The string processing in the last section should hopefully reduce inconsistencies in names. 
+
+Among articles where the first/last author's gender was assigned, about 22-30% of first and last authors submitted multiple manuscripts to the journal. About 55% of manuscripts were written by first authors with multiple manuscripts, and about 66% were written by last authors with multiple manuscripts. In general, fewer female authors appear to submit multiple articles and a lower percent of articles written by first/last authors with multiple articles have a female first/last author. 
+
+```{r}
+# Tabulate articles by author
+first_author_tab = df_original %>%
+  drop_na(first_author_gender) %>% 
+  group_by(first_author) %>%
+  summarize(first_author_gender = first(first_author_gender), n = n()) %>% 
+  ungroup()
+last_author_tab = df_original %>%
+  drop_na(last_author_gender) %>% 
+  group_by(last_author) %>%
+  summarize(last_author_gender = first(last_author_gender), n = n()) %>% 
+  ungroup()
+
+rbind("Percent of first authors with more than one article" = 
+        c(tapply(first_author_tab$n > 1, 
+                 first_author_tab$first_author_gender, mean), 
+          Overall = mean(first_author_tab$n > 1)), 
+      "Percent of last authors with more than one article" = 
+        c(tapply(last_author_tab$n > 1, 
+                 last_author_tab$last_author_gender, mean), 
+          Overall = mean(last_author_tab$n > 1))) %>% round(3)
+
+rbind("Percent of articles written by first authors with more than one article" = 
+        c(first_author_tab %>% 
+            group_by(first_author_gender) %>% 
+            summarize(prop = sum(n[n>1]) / sum(n)) %>% 
+            pull(prop) %>% set_names(c("Man", "Woman")), 
+          Overall = sum(first_author_tab$n[first_author_tab$n > 1]) / 
+            sum(first_author_tab$n)), 
+      "Percent of articles written by last authors with more than one article" = 
+        c(last_author_tab %>% 
+            group_by(last_author_gender) %>% 
+            summarize(prop = sum(n[n>1]) / sum(n)) %>% 
+            pull(prop) %>% set_names(c("Man", "Woman")), 
+          Overall = sum(last_author_tab$n[last_author_tab$n > 1]) / 
+            sum(last_author_tab$n))) %>% round(3)
+```
+
+After dropping articles that were submitted by first or last authors with multiple articles, 6126 articles remain. This is about 23% of the total number of articles (restricted to those where the first and last authors' genders were assigned). 
+
+```{r}
+# Data frame without first or authors with multiple articles
+df_unique_both = df_original[df_original$first_author %in% 
+                               first_author_tab$first_author[first_author_tab$n == 1] & 
+                               df_original$last_author %in% 
+                               last_author_tab$last_author[last_author_tab$n == 1],]
+
+print(paste("Percent of articles remaining:", 
+            round(nrow(df_unique_both) / 
+              nrow(df_original[!is.na(df_original$first_author_gender) & 
+                                 !is.na(df_original$last_author_gender),]), 3)))
+```
+
+Plots of average timee to decision and acceptance rates over time, by gender. 
+
+```{r}
+df_original %>% 
+  pivot_longer(cols = c("first_author_gender", "last_author_gender"), 
+               names_to = "author_type",values_to = "gender", 
+               values_drop_na = TRUE) %>% 
+  group_by(receipt_year, author_type, gender) %>% 
+  summarize(ttd = mean(t_delta, na.rm = TRUE)) %>% 
+  ungroup() %>% 
+  mutate(gender = factor(gender, levels = c("Woman", "Man"))) %>% 
+  ggplot(aes(x = receipt_year, y = ttd, color = gender)) + 
+  geom_point() + 
+  facet_grid(~author_type, 
+             labeller = as_labeller(c(
+               "first_author_gender" = "First author", 
+               "last_author_gender" = "Last author"))) + 
+  xlab("Year") + ylab("Time to decision (days)") + 
+  scale_color_discrete(name = "Gender")
+ggsave("ttd_over_time.png")
+
+df_original %>% 
+  pivot_longer(cols = c("first_author_gender", "last_author_gender"), 
+               names_to = "author_type",values_to = "gender", 
+               values_drop_na = TRUE) %>% 
+  group_by(receipt_year, author_type, gender) %>% 
+  summarize(acc_rate = mean(accepted, na.rm = TRUE)) %>% 
+  ungroup() %>% 
+  mutate(gender = factor(gender, levels = c("Woman", "Man"))) %>% 
+  ggplot(aes(x = receipt_year, y = acc_rate, color = gender)) + 
+  geom_point() + 
+  facet_grid(~author_type, 
+             labeller = as_labeller(c(
+               "first_author_gender" = "First author", 
+               "last_author_gender" = "Last author"))) + 
+  xlab("Year") + ylab("Acceptance rate") + 
+  scale_color_discrete(name = "Gender") + 
+  scale_y_continuous(labels = scales::percent)
+ggsave("acc_rate_over_time.png")
+```
+
+
+# Table 1
+
+Below are the number of first/last author genders that were successfully assigned by genderize.io. 
+
+```{r}
+with(df_original, {
+  rbind(First = c(table(first_author_gender), 
+                  Total = sum(!is.na(first_author_gender))),
+        Last = c(table(last_author_gender), 
+                 Total = sum(!is.na(last_author_gender))))
+})
+```
+
+We create a "Table 1" with the number of accepted manuscripts, number of submitted manuscripts, and percent accepted, by year and author gender. 
+
+```{r}
+tab1 = with(df_original, {
+  rbind(
+    cbind(
+      # First author
+      tapply(accepted, list(receipt_year, first_author_gender), sum), 
+      tapply(submitted, list(receipt_year, first_author_gender), sum),
+      round(tapply(accepted, list(receipt_year, first_author_gender), mean), 4)*100, 
+      # Last author
+      tapply(accepted, list(receipt_year, last_author_gender), sum), 
+      tapply(submitted, list(receipt_year, last_author_gender), sum),
+      round(tapply(accepted, list(receipt_year, last_author_gender), mean), 4)*100, 
+      # Overall
+      tapply(accepted, receipt_year, sum), 
+      tapply(submitted, receipt_year, sum),
+      round(tapply(accepted, receipt_year, mean), 4)*100), 
+    
+    # Total
+    Total = c(# First author
+      tapply(accepted, first_author_gender, sum), 
+      tapply(submitted, first_author_gender, sum),
+      round(tapply(accepted, first_author_gender, mean), 4)*100, 
+      # Last author
+      tapply(accepted, last_author_gender, sum), 
+      tapply(submitted, last_author_gender, sum),
+      round(tapply(accepted, last_author_gender, mean), 4)*100, 
+      # Overall
+      sum(accepted), 
+      sum(submitted), 
+      round(mean(accepted), 3)*100)
+    )
+  })
+
+tab1 = rbind(c("First author", "", "", "", "", "", 
+               "Last author", "", "", "", "", "", 
+               "Overall", "", ""), 
+             c(rep(c("Accepted (n)", "", "Submitted (n)", "", 
+                     "Accepted (%)", ""), 2), 
+               c("Accepted (n)", "Submitted (n)", "Accepted (%)")), 
+             c(rep(c("Man", "Woman"), 6), "", "", ""), 
+             tab1)
+write.csv(tab1, file = "tab1.csv")
+```
+
+```{r, echo = FALSE, eval = FALSE}
+sub_tab = list(
+  "First author" = data.frame(
+    Year = 2005:2023, 
+    with(df_original, {
+      tapply(submitted, list(receipt_year, first_author_gender), sum)
+  })), 
+  "Last author" = data.frame(
+    Year = 2005:2023, 
+    with(df_original, {
+      tapply(submitted, list(receipt_year, last_author_gender), sum)
+  }))
+)
+
+sub_prop_tab = as.data.frame(cbind(
+  Year = 2005:2023, 
+  sapply(sub_tab, function(x) {
+    paste0(round(100 * (x$Woman / (x$Woman + x$Man)), 2), "%")
+  }) 
+))
+write.table(sub_prop_tab, file = "sub_prop_tab.csv", sep=",", row.names = FALSE)
+
+melt(sub_tab$`First author`, id.vars = "Year") %>% 
+  ggplot(aes(x = Year, y = value, fill = variable)) + 
+  geom_bar(position = "dodge" , stat = "identity")
+
+melt(sub_tab$`First author`, id.vars = "Year") %>% 
+  ggplot(aes(x = Year, y = value, fill = variable)) + 
+  geom_bar(position = "stack" , stat = "identity")
+melt(sub_tab$`First author`, id.vars = "Year") %>% 
+  ggplot(aes(x = Year, y = value, fill = variable)) + 
+  geom_bar(position = "fill" , stat = "identity")
+```
+
+The proportion of female authors goes up for both first authors and last authors after dropping articles written by authors with multiple articles. It appears that men are more likely to be authors of multiple submissions. 
+
+```{r}
+round(rbind(original = df_original %>% 
+              summarize(first_author = mean(first_author_gender=="Woman", na.rm = TRUE), 
+                        last_author = mean(last_author_gender=="Woman", na.rm = TRUE)), 
+            unique = df_unique_both %>% 
+              summarize(first_author = mean(first_author_gender=="Woman"), 
+                        last_author = mean(last_author_gender=="Woman"))), 3)
+```
+
+This trend also holds among accepted manuscripts. 
+
+```{r}
+round(rbind(original = df_original %>% subset(accepted == TRUE) %>%
+              summarize(first_author = mean(first_author_gender=="Woman", na.rm = TRUE), 
+                        last_author = mean(last_author_gender=="Woman", na.rm = TRUE)), 
+            unique = df_unique_both %>% subset(accepted == TRUE) %>%
+              summarize(first_author = mean(first_author_gender=="Woman"), 
+                        last_author = mean(last_author_gender=="Woman"))), 3)
+```
+
+# Overview of approaches
+
+For each of the analyses in the paper, we tried up to three modeling approaches.
+
+1. When feasible, we applied robust standard errors to linear or logistic regression models. We typically used clustered standard errors where the clusters are defined by the first and last authors. 
+
+2. As far as we are aware, robust standard errors are not available for contingency tables. In such cases (where a contingency table tests cannot be coerced into a regression model), we used the usual chi-squared test. The issue with this approach is that it treats each article as an independent unit, even though this independence assumption is likely violated because authors can submit multiple articles. 
+
+3. When robust standard errors cannot be run for contingency tables, we attempted a secondary analysis that excludes articles written by first/last authors with multiple articles. The assumption here is that the first and last authors create the dependency between articles (and that we don't have to worry about the middle authors or relationships between authors). So if we drop articles that were submitted by first or last authors with multiple articles, we can uphold the independence assumption. However, this results in a large amount of data loss, which may lead to underpowering. Moreover, authors with multiple outcomes may be different from authors with only one article in other ways: for example, more men are authors of multiple articles. 
+
+We collected all of the p-values from the analyses in this document into a single vector. At the end, we used the Benjamini-Hochberg method to adjust these p-values for multiple comparisons. 
+
+```{r}
+all_pvals = c()
+```
+
+# Number of submissions
+
+## Rate of change in number of submissions
+
+This analysis looks at the interaction between year and first and/or last author gender in a linear regression model predicting the number of manuscripts submitted. An indicator for years 2020 and beyond (coinciding with the COVID-19 pandemic) is also included as an interaction. We used robust standard errors, but not clustered standard errors in this case, since the observations fed into the regression model are summarized by year/author gender and cannot be clustered by author. We can repeat this exercise for last authors and first and last author gender pairs. 
+
+```{r}
+# General function to fit linear models of the form 
+# outcome ~ author_gender * year * (year >= 2020)
+change_over_time = function(df, outcome, author_gender) {
+  outcome_tab = tapply(df[[outcome]], 
+                       list(df$receipt_year, df[[author_gender]]), sum)
+  mod_df = data.frame(
+    author_gender = relevel(as.factor(rep(c("Man", "Woman"), 
+                                          each = nrow(outcome_tab))), 
+                            ref = "Man"), 
+    year = rep(as.numeric(rownames(outcome_tab)), 2), 
+    outcome = as.numeric(outcome_tab))
+  mod_df$year_post2020 = mod_df$year >= 2020
+  mod_df = mod_df[mod_df$year != 2023,]
+  fit_lm = lm(outcome ~ author_gender*year*year_post2020, 
+              data = mod_df)
+  return(list(fit = fit_lm, df = outcome_tab))
+}
+
+# General function to fit linear models of the form 
+# outcome ~ first_author_gender * last_author_gender * year * (year >= 2020)
+change_over_time_author_interaction = function(df, outcome, 
+                                               ref_first = "Man", 
+                                               ref_last = "Man") {
+  outcome_tab = tapply(df[[outcome]], 
+                       list(df$receipt_year, 
+                            interaction(df$first_author_gender, 
+                                        df$last_author_gender)), sum)
+  mod_df = data.frame(
+    first_author_gender = 
+      relevel(as.factor(rep(rep(c("Man", "Woman"), 
+                                each = nrow(outcome_tab)), 2)), 
+              ref = ref_first), 
+    last_author_gender = 
+      relevel(as.factor(rep(c("Man", "Woman"), 
+                            each = 2*nrow(outcome_tab))), 
+              ref = ref_last), 
+    year = rep(as.numeric(rownames(outcome_tab)), 4), 
+    outcome = as.numeric(outcome_tab))
+  mod_df$author_gender_pair = interaction(mod_df$first_author_gender, 
+                                          mod_df$last_author_gender, sep = " ")
+  mod_df$year_post2020 = mod_df$year >= 2020
+  mod_df = mod_df[mod_df$year != 2023,]
+  fit_lm = lm(outcome ~ author_gender_pair*year*year_post2020, data = mod_df)
+  return(list(fit = fit_lm, df = outcome_tab))
+}
+
+# First authors
+sub_rate_first_lm = change_over_time(df_original, 
+                                     "submitted", "first_author_gender")
+sub_rate_first_robust = 
+  emtrends(sub_rate_first_lm$fit, 
+          pairwise ~ author_gender | year_post2020, 
+          vcov = vcovHC, var = "year", 
+          adjust = "none")
+
+# Last authors
+sub_rate_last_lm = change_over_time(df_original, 
+                                    "submitted", "last_author_gender") 
+sub_rate_last_robust = 
+  emtrends(sub_rate_last_lm$fit, 
+          pairwise ~ author_gender | year_post2020, 
+          vcov = vcovHC, var = "year", 
+          adjust = "none")
+
+# First-last author pairs
+sub_rate_pair_lm = change_over_time_author_interaction(df_original, 
+                                                       "submitted") 
+sub_rate_pair_robust = 
+  emtrends(sub_rate_pair_lm$fit, 
+          pairwise ~ author_gender_pair | year_post2020, 
+          vcov = vcovHC, var = "year", 
+          adjust = "none")
+
+# Extract relevant contrasts
+sub_rate_pair_tab = data.frame(sub_rate_pair_robust$contrasts)
+rownames(sub_rate_pair_tab) = 
+  paste(rep(c("(2005-2019)", "(2020-2022)"), each = 6), 
+        sub_rate_pair_tab$contrast)
+sub_rate_pair_pvals = sub_rate_pair_tab[,"p.value"]
+names(sub_rate_pair_pvals) = paste("sub_rate_pair", rownames(sub_rate_pair_tab))
+
+# Collect p-values
+all_pvals = c(
+  all_pvals, 
+  setNames(data.frame(sub_rate_first_robust$contrasts)[,"p.value"], 
+           paste("sub_rate_first", c("pre", "post"))), 
+  setNames(data.frame(sub_rate_last_robust$contrasts)[,"p.value"], 
+           paste("sub_rate_last", c("pre", "post"))), 
+  sub_rate_pair_pvals
+  )
+```
+
+These are the trend etsimates for first authors, last authors, and author pairs, with robust standard errors. 
+
+```{r}
+# First authors
+sub_rate_first_robust$contrasts
+sub_rate_first_robust$emtrends
+# Last authors
+sub_rate_last_robust$contrasts
+sub_rate_last_robust$emtrends
+# First-last author pairs
+sub_rate_pair_robust$contrasts
+sub_rate_pair_robust$emtrends
+```
+
+Here, we restrict to unique first, last, and first-last author pairs for each year's submissions. 
+
+```{r}
+# Unique authors
+# First authors
+sub_rate_first_lm2 = 
+  change_over_time(df_original %>%
+                     select(submitted, first_author_gender, 
+                            first_author, receipt_year) %>% 
+                     unique(), "submitted", "first_author_gender")
+sub_rate_first_robust2 = 
+    emtrends(sub_rate_first_lm2$fit, 
+          pairwise ~ author_gender | year_post2020, 
+          vcov = vcovHC, var = "year", 
+          adjust = "none")
+
+# Last authors
+sub_rate_last_lm2 = 
+  change_over_time(df_original %>%
+                     select(submitted, last_author_gender, 
+                            last_author, receipt_year) %>% 
+                     unique(), "submitted", "last_author_gender")
+sub_rate_last_robust2 = 
+    emtrends(sub_rate_last_lm2$fit, 
+          pairwise ~ author_gender | year_post2020, 
+          vcov = vcovHC, var = "year", 
+          adjust = "none")
+
+# First-last author pairs
+sub_rate_pair_lm2 = change_over_time_author_interaction(
+  df_original %>% select(submitted, first_author_gender, first_author, 
+                         last_author_gender, last_author, receipt_year) %>% 
+                     unique(), "submitted") 
+sub_rate_pair_robust2 = 
+  emtrends(sub_rate_pair_lm2$fit, 
+          pairwise ~ author_gender_pair | year_post2020, 
+          vcov = vcovHC, var = "year", 
+          adjust = "none")
+
+# Extract relevant contrasts
+sub_rate_pair_tab2 = data.frame(sub_rate_pair_robust2$contrasts)
+rownames(sub_rate_pair_tab2) = 
+  paste(rep(c("(2005-2019)", "(2020-2022)"), each = 6), 
+        sub_rate_pair_tab2$contrast)
+sub_rate_pair_pvals2 = sub_rate_pair_tab2[,"p.value"]
+names(sub_rate_pair_pvals2) = paste("sub_rate_pair2", rownames(sub_rate_pair_tab2))
+
+# Collect p-values
+all_pvals = c(
+  all_pvals, 
+  setNames(data.frame(sub_rate_first_robust2$contrasts)[,"p.value"], 
+           paste("sub_rate_first2", c("pre", "post"))), 
+  setNames(data.frame(sub_rate_last_robust2$contrasts)[,"p.value"], 
+           paste("sub_rate_last2", c("pre", "post"))), 
+  sub_rate_pair_pvals2
+  )
+
+# First authors
+sub_rate_first_robust2$contrasts
+sub_rate_first_robust2$emtrends
+# Last authors
+sub_rate_last_robust2$contrasts
+sub_rate_last_robust2$emtrends
+# First-last author pairs
+sub_rate_pair_robust2$contrasts
+sub_rate_pair_robust2$emtrends
+```
+
+We re-run the analysis for first and last author gender, but normalize the outcome (number of submissions by gender) by the total number of board-certified surgeons by gender for that year. 
+
+```{r}
+# Read in number of certified surgeons each year, by gender
+gen_surg_df = read.csv("../CERTIFIED SURGEONS BY GENDER.csv", skip = 1)
+# Some data processing
+colnames(gen_surg_df) = c("year", "author_gender", "gen_surg")
+gen_surg_df = gen_surg_df %>%
+  mutate(author_gender = relevel(as.factor(
+    ifelse(author_gender == "Female", "Woman", "Man")), ref = "Man")) %>%
+  filter(year >=2005 & year <= 2022)
+
+
+# General function to fit linear models of the form 
+# outcome/num_surgeons ~ author_gender * year
+change_over_time_gen_surg = function(df, outcome, author_gender, 
+                                     gs_df = gen_surg_df) {
+  outcome_tab = tapply(df[[outcome]], 
+                       list(df$receipt_year, df[[author_gender]]), sum)
+  mod_df = data.frame(
+    author_gender = relevel(as.factor(rep(c("Man", "Woman"), 
+                                          each = nrow(outcome_tab))), 
+                            ref = "Man"), 
+    year = rep(as.numeric(rownames(outcome_tab)), 2), 
+    outcome = as.numeric(outcome_tab))
+  mod_df$year_post2020 = mod_df$year >= 2020
+  mod_df = mod_df[mod_df$year != 2023,]
+  mod_df = merge(mod_df, gs_df, by = c("year", "author_gender"))
+  fit_lm = lm(outcome/gen_surg ~ author_gender*year*year_post2020,
+              data = mod_df)
+  
+  outcome_tab = outcome_tab / 
+    (pivot_wider(gs_df, names_from = author_gender, values_from = gen_surg) %>% 
+       column_to_rownames("year") %>% 
+       select(Man, Woman))
+  return(list(fit = fit_lm, df = as.matrix(outcome_tab)))
+}
+
+# First authors
+sub_rate_gs_first_lm = change_over_time_gen_surg(df_original, 
+                                                 "submitted", 
+                                                 "first_author_gender")
+sub_rate_gs_first_robust = 
+    emtrends(sub_rate_gs_first_lm$fit, 
+          pairwise ~ author_gender | year_post2020, 
+          vcov = vcovHC, var = "year", 
+          adjust = "none")
+
+# Last authors
+sub_rate_gs_last_lm = change_over_time_gen_surg(df_original, 
+                                                "submitted", 
+                                                "last_author_gender") 
+sub_rate_gs_last_robust = 
+    emtrends(sub_rate_gs_last_lm$fit, 
+          pairwise ~ author_gender | year_post2020, 
+          vcov = vcovHC, var = "year", 
+          adjust = "none")
+
+# Collect p-values
+all_pvals = c(
+  all_pvals, 
+  setNames(data.frame(sub_rate_gs_first_robust$contrasts)[,"p.value"], 
+           paste("sub_rate_gs_first", c("pre", "post"))), 
+  setNames(data.frame(sub_rate_gs_last_robust$contrasts)[,"p.value"], 
+           paste("sub_rate_gs_last", c("pre", "post")))
+  )
+
+
+# First authors
+sub_rate_gs_first_robust$contrasts
+sub_rate_gs_first_robust$emtrends
+# Last authors
+sub_rate_gs_last_robust$contrasts
+sub_rate_gs_last_robust$emtrends
+```
+
+## Time to decision
+
+We fit linear regression models to assess the relationship between first or last author gender and time to decision, with cluster robust errors. We include an interaction effect for whether the submission was received prior to January 1, 2014 (pre-pandemic, before discontinuity), between January 1, 2014 and March 24, 2020 (pre-pandemic, after discontinuity), or after to March 24, 2020 (pandemic). 
+
+```{r}
+# First author 
+time_first_prepost_lm = lm(t_delta ~ first_author_gender*time_periods, 
+                           data = df_original)
+time_first_prepost_robust = 
+  emmeans(time_first_prepost_lm, 
+          pairwise ~ first_author_gender | time_periods, 
+          vcov = sandwich::vcovCL(time_first_prepost_lm, 
+                                  cluster = ~first_author*last_author), 
+          adjust = "none")
+
+# Last author
+time_last_prepost_lm = lm(t_delta ~ last_author_gender*time_periods, 
+                          data = df_original)
+time_last_prepost_robust = 
+  emmeans(time_last_prepost_lm, 
+          pairwise ~ last_author_gender | time_periods, 
+          vcov = sandwich::vcovCL(time_last_prepost_lm, 
+                                  cluster = ~first_author*last_author), 
+          adjust = "none")
+
+# Collect p-values
+all_pvals = c(
+  all_pvals, 
+  setNames(data.frame(time_first_prepost_robust$contrasts)[,"p.value"], 
+           paste("time_first_prepost", 1:3)), 
+  setNames(data.frame(time_last_prepost_robust$contrasts)[,"p.value"], 
+           paste("time_last_prepost", 1:3))
+)
+
+# First authors
+time_first_prepost_robust$contrasts
+time_first_prepost_robust$emmeans
+
+# Last authors
+time_last_prepost_robust$contrasts
+time_last_prepost_robust$emmeans
+```
+
+### Author pairs
+
+Now, we consider all pairwise comparisons between author pairs for time to decision. 
+
+```{r}
+time_pairs_prepost_lm = 
+  lm(t_delta ~ first_author_gender*last_author_gender*time_periods, 
+     data = df_original)
+# Gender pairs within each time period
+time_pairs_prepost_gender_robust = 
+  emmeans(time_pairs_prepost_lm, 
+          pairwise ~ first_author_gender*last_author_gender | time_periods, 
+          vcov = sandwich::vcovCL(time_pairs_prepost_lm, 
+                                  cluster = ~first_author*last_author), 
+          adjust = "none")
+
+# Time to decision p-values
+# Gender pairs within each time period
+time_pairs_prepost_gender_pvals = 
+  summary(time_pairs_prepost_gender_robust$contrasts)[,"p.value"]
+names(time_pairs_prepost_gender_pvals) = 
+  paste(rep(c("time (pre-pandemic, before discontinuity)",
+              "time (pre-pandemic, after discontinuity)", 
+              "time (pandemic)"), each = 6), 
+        as.character(time_pairs_prepost_gender_robust$contrasts@levels$contrast))
+
+# Collect p-values
+all_pvals = c(
+  all_pvals, 
+  time_pairs_prepost_gender_pvals
+)
+
+# Gender pairs within each time period
+time_pairs_prepost_gender_robust$contrasts
+time_pairs_prepost_gender_robust$emmeans
+```
+
+```{r}
+png("ttd_pairs_pre_post.png", width = 1000, height = 750, res = 140)
+rbind(data.frame(time_pairs_prepost_gender_robust$emmeans)) %>% 
+  mutate(group = interaction(first_author_gender, last_author_gender, sep = ", "), 
+         time_periods = factor(case_when(
+           time_periods == "1" ~ "Pre-pandemic, before discontinuity", 
+           time_periods == "2" ~ "Pre-pandemic, after discontinuity", 
+           time_periods == "3" ~ "Pandemic"), 
+           levels = c("Pre-pandemic, before discontinuity", 
+                      "Pre-pandemic, after discontinuity", "Pandemic"))) %>% 
+  ggplot(aes(x = emmean, y = group, color = time_periods)) + 
+  geom_pointrange(aes(xmin = lower.CL, xmax = upper.CL), size = 0.25, 
+                  position = position_jitterdodge(jitter.width = 0.01)) + 
+  xlab("Time to Decision (Days)") + 
+  ylab("First Author Gender, Last Author Gender") + 
+  ggtitle("Time to Decision for Author Pairs") + 
+  guides(color = guide_legend(ncol = 1)) + 
+  theme(legend.position = "bottom", legend.title = element_blank())
+dev.off()
+```
+
+# Number of accepted manuscripts
+
+## Rate of change in number of accepted manuscripts
+
+This is the same as the analysis for the rate of change in number of submitted manuscripts, except that now we subset the data to only include accepted manuscripts. 
+
+```{r}
+# First authors
+acc_rate_first_lm = change_over_time(df_original, 
+                                     "accepted", "first_author_gender")
+acc_rate_first_robust = 
+  emtrends(acc_rate_first_lm$fit, 
+          pairwise ~ author_gender | year_post2020, 
+          vcov = vcovHC, var = "year", 
+          adjust = "none")
+
+# Last authors
+acc_rate_last_lm = change_over_time(df_original, 
+                                    "accepted", "last_author_gender") 
+acc_rate_last_robust = 
+  emtrends(acc_rate_last_lm$fit, 
+          pairwise ~ author_gender | year_post2020, 
+          vcov = vcovHC, var = "year", 
+          adjust = "none")
+
+# First-last author pairs
+acc_rate_pair_lm = change_over_time_author_interaction(df_original, 
+                                                       "accepted") 
+acc_rate_pair_robust = 
+  emtrends(acc_rate_pair_lm$fit, 
+          pairwise ~ author_gender_pair | year_post2020, 
+          vcov = vcovHC, var = "year", 
+          adjust = "none")
+
+# Extract relevant contrasts
+acc_rate_pair_tab = data.frame(acc_rate_pair_robust$contrasts)
+rownames(acc_rate_pair_tab) = 
+  paste(rep(c("(2005-2019)", "(2020-2022)"), each = 6), 
+        acc_rate_pair_tab$contrast)
+acc_rate_pair_pvals = acc_rate_pair_tab[,"p.value"]
+names(acc_rate_pair_pvals) = paste("acc_rate_pair", rownames(acc_rate_pair_tab))
+
+# Collect p-values
+all_pvals = c(
+  all_pvals, 
+  setNames(data.frame(acc_rate_first_robust$contrasts)[,"p.value"], 
+           paste("acc_rate_first", c("pre", "post"))), 
+  setNames(data.frame(acc_rate_last_robust$contrasts)[,"p.value"], 
+           paste("acc_rate_last", c("pre", "post"))), 
+  acc_rate_pair_pvals
+  )
+```
+
+These are the trend etsimates for first authors, last authors, and author pairs, with robust standard errors. 
+
+```{r}
+# First authors
+acc_rate_first_robust$contrasts
+acc_rate_first_robust$emtrends
+# Last authors
+acc_rate_last_robust$contrasts
+acc_rate_last_robust$emtrends
+# First-last author pairs
+acc_rate_pair_robust$contrasts
+acc_rate_pair_robust$emtrends
+```
+
+Here, we restrict to unique first, last, and first-last author pairs for each year's acceptances. 
+
+```{r}
+# Unique authors
+# First authors
+acc_rate_first_lm2 = 
+  change_over_time(df_original %>%
+                     select(accepted, first_author_gender, 
+                            first_author, receipt_year) %>% 
+                     unique(), "accepted", "first_author_gender")
+acc_rate_first_robust2 = 
+    emtrends(acc_rate_first_lm2$fit, 
+          pairwise ~ author_gender | year_post2020, 
+          vcov = vcovHC, var = "year", 
+          adjust = "none")
+
+# Last authors
+acc_rate_last_lm2 = 
+  change_over_time(df_original %>%
+                     select(accepted, last_author_gender, 
+                            last_author, receipt_year) %>% 
+                     unique(), "accepted", "last_author_gender")
+acc_rate_last_robust2 = 
+    emtrends(acc_rate_last_lm2$fit, 
+          pairwise ~ author_gender | year_post2020, 
+          vcov = vcovHC, var = "year", 
+          adjust = "none")
+
+# First-last author pairs
+acc_rate_pair_lm2 = change_over_time_author_interaction(
+  df_original %>% select(accepted, first_author_gender, first_author, 
+                         last_author_gender, last_author, receipt_year) %>% 
+                     unique(), "accepted") 
+acc_rate_pair_robust2 = 
+  emtrends(acc_rate_pair_lm2$fit, 
+          pairwise ~ author_gender_pair | year_post2020, 
+          vcov = vcovHC, var = "year", 
+          adjust = "none")
+
+# Extract relevant contrasts
+acc_rate_pair_tab2 = data.frame(acc_rate_pair_robust2$contrasts)
+rownames(acc_rate_pair_tab2) = 
+  paste(rep(c("(2005-2019)", "(2020-2022)"), each = 6), 
+        acc_rate_pair_tab2$contrast)
+acc_rate_pair_pvals2 = acc_rate_pair_tab2[,"p.value"]
+names(acc_rate_pair_pvals2) = paste("acc_rate_pair2", rownames(acc_rate_pair_tab2))
+
+# Collect p-values
+all_pvals = c(
+  all_pvals, 
+  setNames(data.frame(acc_rate_first_robust2$contrasts)[,"p.value"], 
+           paste("acc_rate_first2", c("pre", "post"))), 
+  setNames(data.frame(acc_rate_last_robust2$contrasts)[,"p.value"], 
+           paste("acc_rate_last2", c("pre", "post"))), 
+  acc_rate_pair_pvals2
+  )
+
+# First authors
+acc_rate_first_robust2$contrasts
+acc_rate_first_robust2$emtrends
+# Last authors
+acc_rate_last_robust2$contrasts
+acc_rate_last_robust2$emtrends
+# First-last author pairs
+acc_rate_pair_robust2$contrasts
+acc_rate_pair_robust2$emtrends
+```
+
+We re-run the analysis for first and last author gender, but normalize the outcome (number of acceptances by gender) by the total number of board-certified surgeons by gender for that year. 
+
+```{r}
+# First authors
+acc_rate_gs_first_lm = change_over_time_gen_surg(df_original, 
+                                                 "accepted", 
+                                                 "first_author_gender")
+acc_rate_gs_first_robust = 
+    emtrends(acc_rate_gs_first_lm$fit, 
+          pairwise ~ author_gender | year_post2020, 
+          vcov = vcovHC, var = "year", 
+          adjust = "none")
+
+# Last authors
+acc_rate_gs_last_lm = change_over_time_gen_surg(df_original, 
+                                                "accepted", 
+                                                "last_author_gender") 
+acc_rate_gs_last_robust = 
+    emtrends(acc_rate_gs_last_lm$fit, 
+          pairwise ~ author_gender | year_post2020, 
+          vcov = vcovHC, var = "year", 
+          adjust = "none")
+
+# Collect p-values
+all_pvals = c(
+  all_pvals, 
+  setNames(data.frame(acc_rate_gs_first_robust$contrasts)[,"p.value"], 
+           paste("acc_rate_gs_first", c("pre", "post"))), 
+  setNames(data.frame(acc_rate_gs_last_robust$contrasts)[,"p.value"], 
+           paste("acc_rate_gs_last", c("pre", "post")))
+  )
+
+
+# First authors
+acc_rate_gs_first_robust$contrasts
+acc_rate_gs_first_robust$emtrends
+# Last authors
+acc_rate_gs_last_robust$contrasts
+acc_rate_gs_last_robust$emtrends
+```
+
+This figure plots the linear regression lines for the number of submissions and acceptances by year and first, last, and first/last author gender. The raw data counts are shown as points. 
+
+```{r}
+plot_change_over_time = 
+  function(obj, paired, outcome, author_gender, fig_lab, 
+           my_pal = c("#0072B2", "#D55E00", "#E69F00", "#009E73")) {
+    
+  # Helper function for generating labels
+  lm_lab = function(group, m, b) {
+    paste0(group, "\ny = " , round(m), "x", sign(b), round(abs(b)))
+  }
+  # Extract coefficients from lm
+  coefs = coef(obj$fit)
+  
+  # Remove 2023 (incomplete year)
+  obj$df = obj$df[rownames(obj$df) != 2023,]
+  
+  # Set up data frames for plotting
+  if (paired == FALSE) { # First or last author, not paired
+    plot_df = melt(obj$df) %>% 
+      mutate(post2020 = Var1 >= 2020, 
+             label = "")
+    plot_df$label[plot_df$Var1 == 2020] = 
+      c("Man", "Woman")
+      # c(lm_lab("Men", coefs[3], coefs[1]), 
+      #   lm_lab("Women", sum(coefs[3:4]), sum(coefs[1:2])))
+  } else { # first/last author pairs
+    plot_df = melt(obj$df) %>% 
+      within(Var2 <- factor(Var2, levels = c("Man.Man", "Woman.Woman",
+                                             "Man.Woman", "Woman.Man"))) %>% 
+      mutate(post2020 = Var1 >= 2020, 
+             label = "")
+    plot_df$label[plot_df$Var1 == 2020] = 
+      c("Man, Man", "Woman, Man", "Man, Woman", "Woman, Woman")
+      # c(lm_lab("Man, Man", coefs[5], coefs[1]), 
+      #   lm_lab("Woman, Man", sum(coefs[c(5:6)]), sum(coefs[c(1:2)])), 
+      #   lm_lab("Man, Woman", sum(coefs[c(5,7)]), sum(coefs[c(1,3)])), 
+      #   lm_lab("Woman, Woman", sum(coefs[c(5,8)]), sum(coefs[c(1,4)])))
+  }
+  
+  # Plot
+   p1 = plot_df %>% 
+    ggplot(aes(x = Var1, y = value, color = Var2)) + 
+    geom_point(size = 1) +
+    geom_smooth(aes(group = interaction(Var2, post2020)), 
+                method = "lm", se = FALSE, linewidth = 0.7) + 
+    scale_color_manual(values = my_pal, guide = "none") + 
+    geom_label_repel(aes(label = label),
+                     seed = 1, hjust = 0, size = 4, force = 45,
+                     segment.color = NA, fill = alpha(c("white"), 0.5),
+                     xlim = c(min(plot_df$Var1), max(plot_df$Var1)),
+                     ylim = c(min(plot_df$value), max(plot_df$value))) +
+    xlab("Year of Receipt") + 
+    ylab("Manuscript Count") + 
+    ggtitle(paste(fig_lab, "Number of", outcome, "\nby", author_gender)) + 
+    theme(plot.title = element_text(size = 13, hjust = 0.5), 
+          axis.title = element_text(size = 13), 
+          axis.text = element_text(size = 11))
+  
+  return(p1)
+}
+
+p1 = plot_change_over_time(sub_rate_first_lm, FALSE, 
+                           "Submissions", "First Author Gender", "(a)")
+p2 = plot_change_over_time(sub_rate_last_lm, FALSE, 
+                           "Submissions", "Last Author Gender", "(b)")
+p3 = plot_change_over_time(sub_rate_pair_lm, TRUE, 
+                           "Submissions", 
+                           "First, Last Author Gender Pairs", "(c)")
+p4 = plot_change_over_time(acc_rate_first_lm, FALSE, 
+                           "Manuscripts Accepted", "First Author Gender", "(d)")
+p5 = plot_change_over_time(acc_rate_last_lm, FALSE, 
+                           "Manuscripts Accepted", "Last Author Gender", "(e)")
+p6 = plot_change_over_time(acc_rate_pair_lm, TRUE, 
+                           "Manuscripts Accepted", 
+                           "First, Last Author Gender Pairs", "(f)")
+
+png("regress_over_time.png", width = 1500, height = 1050, res = 140)
+grid.arrange(p1, p2, p3, p4, p5, p6, nrow = 2, ncol = 3)
+dev.off()
+```
+
+This figure reproduces the linear regression plots, but using the results based on unique authors. 
+
+```{r}
+p1 = plot_change_over_time(sub_rate_first_lm2, FALSE, 
+                           "Submissions", "First Author Gender", "(a)")
+p2 = plot_change_over_time(sub_rate_last_lm2, FALSE, 
+                           "Submissions", "Last Author Gender", "(b)")
+p3 = plot_change_over_time(sub_rate_pair_lm2, TRUE, 
+                           "Submissions", 
+                           "First, Last Author Gender Pairs", "(c)")
+p4 = plot_change_over_time(acc_rate_first_lm2, FALSE, 
+                           "Manuscripts Accepted", "First Author Gender", "(d)")
+p5 = plot_change_over_time(acc_rate_last_lm2, FALSE, 
+                           "Manuscripts Accepted", "Last Author Gender", "(e)")
+p6 = plot_change_over_time(acc_rate_pair_lm2, TRUE, 
+                           "Manuscripts Accepted", 
+                           "First, Last Author Gender Pairs", "(f)")
+
+png("regress_over_time2.png", width = 1500, height = 1050, res = 140)
+grid.arrange(p1, p2, p3, p4, p5, p6, nrow = 2, ncol = 3)
+dev.off()
+```
+
+## Chance of acceptance
+
+We fit logistic regression models to assess the relationship between first or last author gender and acceptance rate, with cluster robust errors. We include an interaction effect for whether the submission was received prior to January 1, 2014 (pre-pandemic, before discontinuity), between January 1, 2014 and March 24, 2020 (pre-pandemic, after discontinuity), or after to March 24, 2020 (pandemic). 
+	
+```{r}
+# First author 
+acc_chance_first_prepost_glm = 
+  glm(accepted ~ first_author_gender*time_periods, 
+      data = df_original, family = binomial)
+acc_chance_first_prepost_robust = 
+  emmeans(acc_chance_first_prepost_glm, 
+          pairwise ~ first_author_gender | time_periods, 
+          vcov = sandwich::vcovCL(acc_chance_first_prepost_glm, 
+                                  cluster = ~first_author*last_author), 
+          type = "response", adjust = "none")
+
+# Last author
+acc_chance_last_prepost_glm = 
+  glm(accepted ~ last_author_gender*time_periods, 
+      data = df_original, family = binomial)
+acc_chance_last_prepost_robust = 
+  emmeans(acc_chance_last_prepost_glm, 
+          pairwise ~ last_author_gender | time_periods, 
+          vcov = sandwich::vcovCL(acc_chance_last_prepost_glm, 
+                                  cluster = ~first_author*last_author), 
+          type = "response", adjust = "none")
+
+# Collect p-values
+all_pvals = c(
+  all_pvals, 
+  setNames(data.frame(acc_chance_first_prepost_robust$contrasts)[,"p.value"], 
+           paste("acc_chance_first_prepost", 1:3)), 
+  setNames(data.frame(acc_chance_last_prepost_robust$contrasts)[,"p.value"], 
+           paste("acc_chance_last_prepost", 1:3))
+)
+
+# First authors
+acc_chance_first_prepost_robust$contrasts
+acc_chance_first_prepost_robust$emmeans
+
+# Last authors
+acc_chance_last_prepost_robust$contrasts
+acc_chance_last_prepost_robust$emmeans
+```
+
+### Author pairs
+
+These are the log odds ratios from comparing marginal means for each pairwise comparison of authorship pairs, with robust standard errors. 
+
+```{r}
+acc_chance_pairs_prepost_glm = 
+  glm(accepted ~ first_author_gender*last_author_gender*time_periods, 
+           data = df_original, family = "binomial")
+# Gender pairs within each time period
+acc_chance_pairs_prepost_gender_robust = 
+  emmeans(acc_chance_pairs_prepost_glm, 
+          pairwise ~ first_author_gender*last_author_gender | time_periods, 
+          vcov = sandwich::vcovCL(acc_chance_pairs_prepost_glm, 
+                                  cluster = ~first_author*last_author), 
+          type = "response", adjust = "none")
+
+# Chance of acceptance p-values
+# Gender pairs within each time period
+acc_chance_pairs_prepost_gender_pvals = 
+  summary(acc_chance_pairs_prepost_gender_robust$contrasts)[,"p.value"]
+names(acc_chance_pairs_prepost_gender_pvals) = 
+  paste(rep(c("acc_chance (pre-pandemic, before discontinuity)",
+              "acc_chance (pre-pandemic, after discontinuity)", 
+              "acc_chance (pandemic)"), each = 6), 
+        as.character(acc_chance_pairs_prepost_gender_robust$contrasts@levels$contrast))
+
+# Collect p-values
+all_pvals = c(
+  all_pvals, 
+  acc_chance_pairs_prepost_gender_pvals
+)
+
+# Gender pairs within each time period
+acc_chance_pairs_prepost_gender_robust$contrasts
+acc_chance_pairs_prepost_gender_robust$emmeans
+```
+
+```{r}
+png("acc_rate_pairs_pre_post.png", width = 1000, height = 750, res = 140)
+rbind(data.frame(acc_chance_pairs_prepost_gender_robust$emmeans)) %>% 
+  mutate(group = interaction(first_author_gender, last_author_gender, sep = ", "), 
+         time_periods = factor(case_when(
+           time_periods == "1" ~ "Pre-pandemic, before discontinuity", 
+           time_periods == "2" ~ "Pre-pandemic, after discontinuity", 
+           time_periods == "3" ~ "Pandemic"), 
+           levels = c("Pre-pandemic, before discontinuity", 
+                      "Pre-pandemic, after discontinuity", "Pandemic"))) %>% 
+  ggplot(aes(x = prob, y = group, color = time_periods)) + 
+  geom_pointrange(aes(xmin = asymp.LCL, xmax = asymp.UCL), size = 0.25, 
+                  position = position_jitterdodge(jitter.width = 0.01)) + 
+  xlab("Probability of Acceptance") + 
+  ylab("First Author Gender, Last Author Gender") + 
+  ggtitle("Probability of Acceptance for Author Pairs") + 
+  guides(color = guide_legend(ncol = 1)) + 
+  theme(legend.position = "bottom", legend.title = element_blank()) + 
+  scale_x_continuous(labels = scales::percent)
+dev.off()
+```
+
+# Authorship pairs
+
+We used chi-squared contingency table tests to assess if first authors and last authors of each gender are more likely to work with each other than would be expected by chance. We considered authorship patterns for all submissions and when restricted to acceptances, and included a sensitivity analysis that drops articles written by first/last authors with multiple articles. 
+
+```{r}
+# Run proportions test for each authorship pair
+author_pair_prop = function(df) {
+  # Expected proportion of female authors
+  expected_first = df %>% 
+    summarize(Woman = mean(first_author_gender == "Woman", na.rm = TRUE), 
+              Man = mean(first_author_gender == "Man", na.rm = TRUE)) %>% 
+    unlist()
+  expected_last = df %>% 
+    summarize(Woman = mean(last_author_gender == "Woman", na.rm = TRUE), 
+              Man = mean(last_author_gender == "Man", na.rm = TRUE)) %>% 
+    unlist()
+  
+  # Observed counts of each authorship pair
+  observed = with(df, {
+    table(first_author_gender, last_author_gender)
+  })
+  n = with(df, {
+    sum(!is.na(first_author_gender) & !is.na(last_author_gender))
+  })
+  
+  out = data.frame(
+    do.call(rbind, 
+            lapply(c("Woman", "Man"), function(first) {
+              t(sapply(c("Woman", "Man"), function(last) {
+                res = prop.test(observed[first, last], n, 
+                                expected_first[first] * expected_last[last])
+                return(data.frame("First" = first, "Last" = last, 
+                                  Observed = observed[first, last] / n, 
+                                  Expected = expected_first[first] * expected_last[last], 
+                                  "X-squared" = res$statistic, 
+                                  df = res$parameter, 
+                                  pvalue = res$p.value))
+              }))
+            })
+    )
+  )
+  rownames(out) = NULL
+  return(out)
+}
+```
+
+## Pre-pandemic, before discontinuity
+
+Restricting to pre-pandemic period before discontinuity. 
+
+```{r}
+# Submissions
+# Original
+sub_author_by_pair_original_pre = 
+  author_pair_prop(df_original %>% filter(time_periods == "1"))
+sub_author_by_pair_original_pre
+# Unique
+sub_author_by_pair_unique_pre = 
+  author_pair_prop(df_unique_both %>% filter(time_periods == "1"))
+sub_author_by_pair_unique_pre
+
+# Acceptances
+# Original
+acc_author_by_pair_original_pre = 
+  author_pair_prop(df_original %>% filter(accepted == 1, time_periods == "1"))
+acc_author_by_pair_original_pre
+# Unique
+acc_author_by_pair_unique_pre = 
+  author_pair_prop(df_unique_both %>% filter(accepted == 1, time_periods == "1"))
+acc_author_by_pair_unique_pre
+
+# Author pair p-values
+sub_author_by_pair_original_pre_pvals =
+    unlist(sub_author_by_pair_original_pre$pvalue)
+names(sub_author_by_pair_original_pre_pvals) = 
+  paste("sub_author_pair_original_pre", 
+        sub_author_by_pair_original_pre$First, 
+        sub_author_by_pair_original_pre$Last)
+
+sub_author_by_pair_unique_pre_pvals =
+    unlist(sub_author_by_pair_unique_pre$pvalue)
+names(sub_author_by_pair_unique_pre_pvals) = 
+  paste("sub_author_pair_unique_pre", 
+        sub_author_by_pair_unique_pre$First, 
+        sub_author_by_pair_unique_pre$Last)
+
+acc_author_by_pair_original_pre_pvals =
+    unlist(acc_author_by_pair_original_pre$pvalue)
+names(acc_author_by_pair_original_pre_pvals) = 
+  paste("acc_author_pair_original_pre", 
+        acc_author_by_pair_original_pre$First, 
+        acc_author_by_pair_original_pre$Last)
+
+acc_author_by_pair_unique_pre_pvals =
+    unlist(acc_author_by_pair_unique_pre$pvalue)
+names(acc_author_by_pair_unique_pre_pvals) = 
+  paste("acc_author_pair_unique_pre", 
+        acc_author_by_pair_unique_pre$First, 
+        acc_author_by_pair_unique_pre$Last)
+
+# Collect p-values
+all_pvals = c(
+  all_pvals, 
+  sub_author_by_pair_original_pre_pvals, sub_author_by_pair_unique_pre_pvals, 
+  acc_author_by_pair_original_pre_pvals, acc_author_by_pair_unique_pre_pvals
+)
+```
+
+## Pre-pandemic, after discontinuity
+
+Restricting to pre-pandemic period before discontinuity. 
+
+```{r}
+# Submissions
+# Original
+sub_author_by_pair_original_pre2 = 
+  author_pair_prop(df_original %>% filter(time_periods == "2"))
+sub_author_by_pair_original_pre2
+# Unique
+sub_author_by_pair_unique_pre2 = 
+  author_pair_prop(df_unique_both %>% filter(time_periods == "2"))
+sub_author_by_pair_unique_pre2
+
+# Acceptances
+# Original
+acc_author_by_pair_original_pre2 = 
+  author_pair_prop(df_original %>% filter(accepted == 1, time_periods == "2"))
+acc_author_by_pair_original_pre2
+# Unique
+acc_author_by_pair_unique_pre2 = 
+  author_pair_prop(df_unique_both %>% filter(accepted == 1, time_periods == "2"))
+acc_author_by_pair_unique_pre2
+
+# Author pair p-values
+sub_author_by_pair_original_pre2_pvals =
+    unlist(sub_author_by_pair_original_pre2$pvalue)
+names(sub_author_by_pair_original_pre2_pvals) = 
+  paste("sub_author_pair_original_pre2", 
+        sub_author_by_pair_original_pre2$First, 
+        sub_author_by_pair_original_pre2$Last)
+
+sub_author_by_pair_unique_pre2_pvals =
+    unlist(sub_author_by_pair_unique_pre2$pvalue)
+names(sub_author_by_pair_unique_pre2_pvals) = 
+  paste("sub_author_pair_unique_pre2", 
+        sub_author_by_pair_unique_pre2$First, 
+        sub_author_by_pair_unique_pre2$Last)
+
+acc_author_by_pair_original_pre2_pvals =
+    unlist(acc_author_by_pair_original_pre2$pvalue)
+names(acc_author_by_pair_original_pre2_pvals) = 
+  paste("acc_author_pair_original_pre2", 
+        acc_author_by_pair_original_pre2$First, 
+        acc_author_by_pair_original_pre2$Last)
+
+acc_author_by_pair_unique_pre2_pvals =
+    unlist(acc_author_by_pair_unique_pre2$pvalue)
+names(acc_author_by_pair_unique_pre2_pvals) = 
+  paste("acc_author_pair_unique_pre2", 
+        acc_author_by_pair_unique_pre2$First, 
+        acc_author_by_pair_unique_pre2$Last)
+
+# Collect p-values
+all_pvals = c(
+  all_pvals, 
+  sub_author_by_pair_original_pre2_pvals, sub_author_by_pair_unique_pre2_pvals, 
+  acc_author_by_pair_original_pre2_pvals, acc_author_by_pair_unique_pre2_pvals
+)
+```
+
+## Pandemic 
+
+Restricting to pandemic period. 
+
+```{r}
+# Submissions
+# Original
+sub_author_by_pair_original_post = 
+  author_pair_prop(df_original %>% filter(time_periods == "3"))
+sub_author_by_pair_original_post
+# Unique
+sub_author_by_pair_unique_post = 
+  author_pair_prop(df_unique_both %>% filter(time_periods == "3"))
+sub_author_by_pair_unique_post
+
+# Acceptances
+# Original
+acc_author_by_pair_original_post = 
+  author_pair_prop(df_original %>% filter(accepted == 1, time_periods == "3"))
+acc_author_by_pair_original_post
+# Unique
+acc_author_by_pair_unique_post = 
+  author_pair_prop(df_unique_both %>% filter(accepted == 1, time_periods == "3"))
+acc_author_by_pair_unique_post
+
+# Author pair p-values
+sub_author_by_pair_original_post_pvals =
+    unlist(sub_author_by_pair_original_post$pvalue)
+names(sub_author_by_pair_original_post_pvals) = 
+  paste("sub_author_pair_original_post", 
+        sub_author_by_pair_original_post$First, 
+        sub_author_by_pair_original_post$Last)
+
+sub_author_by_pair_unique_post_pvals =
+    unlist(sub_author_by_pair_unique_post$pvalue)
+names(sub_author_by_pair_unique_post_pvals) = 
+  paste("sub_author_pair_unique_post", 
+        sub_author_by_pair_unique_post$First, 
+        sub_author_by_pair_unique_post$Last)
+
+acc_author_by_pair_original_post_pvals =
+    unlist(acc_author_by_pair_original_post$pvalue)
+names(acc_author_by_pair_original_post_pvals) = 
+  paste("acc_author_pair_original_post", 
+        acc_author_by_pair_original_post$First, 
+        acc_author_by_pair_original_post$Last)
+
+acc_author_by_pair_unique_post_pvals =
+    unlist(acc_author_by_pair_unique_post$pvalue)
+names(acc_author_by_pair_unique_post_pvals) = 
+  paste("acc_author_pair_unique_post", 
+        acc_author_by_pair_unique_post$First, 
+        acc_author_by_pair_unique_post$Last)
+
+# Collect p-values
+all_pvals = c(
+  all_pvals, 
+  sub_author_by_pair_original_post_pvals, sub_author_by_pair_unique_post_pvals, 
+  acc_author_by_pair_original_post_pvals, acc_author_by_pair_unique_post_pvals
+)
+```
+
+# Multiple comparisons adjustment
+
+We applied a Benjamini-Hochberg multiple comparisons adjustment to control the FDR. 
+
+```{r}
+all_pvals_adj = data.frame(pvals = all_pvals, 
+                           adj_pvals = p.adjust(all_pvals, method = "BH"))
+rownames(all_pvals_adj) = names(all_pvals)
+all_pvals_adj$significant = ifelse(all_pvals_adj$adj_pvals < 0.05, "*", "")
+
+write.csv(all_pvals_adj, file = "all_pvals_adj.csv")
+```
+
+# Additional tables
+
+These tables summarize the regression output for the rate of change in submitted and accepted manuscripts, with an extra column for the adjusted p-values. 
+
+```{r}
+# Submitted manuscripts
+# Pre-pandemic
+sub_over_time_pairs_pre_tab = data.frame(
+  Dataset = c("All", rep("", 5), "Unique", rep("", 5)), 
+  rbind(sub_rate_pair_tab[1:6,], sub_rate_pair_tab2[1:6,]), 
+  adj.p.value = all_pvals_adj[c(names(sub_rate_pair_pvals)[1:6], 
+                                names(sub_rate_pair_pvals2)[1:6]), 
+                              "adj_pvals"])
+rownames(sub_over_time_pairs_pre_tab) = NULL
+sub_over_time_pairs_pre_tab$year_post2020 = NULL
+sub_over_time_pairs_pre_tab$df = NULL
+sub_over_time_pairs_pre_tab$estimate = round(sub_over_time_pairs_pre_tab$estimate, 2)
+sub_over_time_pairs_pre_tab$SE = round(sub_over_time_pairs_pre_tab$SE, 2)
+sub_over_time_pairs_pre_tab$t.ratio = round(sub_over_time_pairs_pre_tab$t.ratio, 2)
+
+colnames(sub_over_time_pairs_pre_tab) = 
+  c("Dataset", "Author Gender Pair Contrast",
+    "Estimate", "Std. Error", "t-Statistic", "p-value", "Adj. p-value")
+
+write.csv(sub_over_time_pairs_pre_tab, 
+          file = "sub_over_time_pairs_pre_tab.csv", row.names = FALSE)
+
+
+# Pandemic
+sub_over_time_pairs_post_tab = data.frame(
+  Dataset = c("All", rep("", 5), "Unique", rep("", 5)), 
+  rbind(sub_rate_pair_tab[7:12,], sub_rate_pair_tab2[7:12,]), 
+  adj.p.value = all_pvals_adj[c(names(sub_rate_pair_pvals)[7:12], 
+                                names(sub_rate_pair_pvals2)[7:12]), 
+                              "adj_pvals"])
+rownames(sub_over_time_pairs_post_tab) = NULL
+sub_over_time_pairs_post_tab$year_post2020 = NULL
+sub_over_time_pairs_post_tab$df = NULL
+sub_over_time_pairs_post_tab$estimate = round(sub_over_time_pairs_post_tab$estimate, 2)
+sub_over_time_pairs_post_tab$SE = round(sub_over_time_pairs_post_tab$SE, 2)
+sub_over_time_pairs_post_tab$t.ratio = round(sub_over_time_pairs_post_tab$t.ratio, 2)
+
+colnames(sub_over_time_pairs_post_tab) = 
+  c("Dataset", "Author Gender Pair Contrast",
+    "Estimate", "Std. Error", "t-Statistic", "p-value", "Adj. p-value")
+
+write.csv(sub_over_time_pairs_post_tab, 
+          file = "sub_over_time_pairs_post_tab.csv", row.names = FALSE)
+
+
+# Accepted manuscripts
+# Pre-pandemic
+acc_over_time_pairs_pre_tab = data.frame(
+  Dataset = c("All", rep("", 5), "Unique", rep("", 5)), 
+  rbind(acc_rate_pair_tab[1:6,], acc_rate_pair_tab2[1:6,]), 
+  adj.p.value = all_pvals_adj[c(names(acc_rate_pair_pvals)[1:6], 
+                                names(acc_rate_pair_pvals2)[1:6]), 
+                              "adj_pvals"])
+rownames(acc_over_time_pairs_pre_tab) = NULL
+acc_over_time_pairs_pre_tab$year_post2020 = NULL
+acc_over_time_pairs_pre_tab$df = NULL
+acc_over_time_pairs_pre_tab$estimate = round(acc_over_time_pairs_pre_tab$estimate, 2)
+acc_over_time_pairs_pre_tab$SE = round(acc_over_time_pairs_pre_tab$SE, 2)
+acc_over_time_pairs_pre_tab$t.ratio = round(acc_over_time_pairs_pre_tab$t.ratio, 2)
+
+colnames(acc_over_time_pairs_pre_tab) = 
+  c("Dataset", "Author Gender Pair Contrast",
+    "Estimate", "Std. Error", "t-Statistic", "p-value", "Adj. p-value")
+
+write.csv(acc_over_time_pairs_pre_tab, 
+          file = "acc_over_time_pairs_pre_tab.csv", row.names = FALSE)
+
+
+# Pandemic
+acc_over_time_pairs_post_tab = data.frame(
+  Dataset = c("All", rep("", 5), "Unique", rep("", 5)), 
+  rbind(acc_rate_pair_tab[7:12,], acc_rate_pair_tab2[7:12,]), 
+  adj.p.value = all_pvals_adj[c(names(acc_rate_pair_pvals)[7:12], 
+                                names(acc_rate_pair_pvals2)[7:12]), 
+                              "adj_pvals"])
+rownames(acc_over_time_pairs_post_tab) = NULL
+acc_over_time_pairs_post_tab$year_post2020 = NULL
+acc_over_time_pairs_post_tab$df = NULL
+acc_over_time_pairs_post_tab$estimate = round(acc_over_time_pairs_post_tab$estimate, 2)
+acc_over_time_pairs_post_tab$SE = round(acc_over_time_pairs_post_tab$SE, 2)
+acc_over_time_pairs_post_tab$t.ratio = round(acc_over_time_pairs_post_tab$t.ratio, 2)
+
+colnames(acc_over_time_pairs_post_tab) = 
+  c("Dataset", "Author Gender Pair Contrast",
+    "Estimate", "Std. Error", "t-Statistic", "p-value", "Adj. p-value")
+
+write.csv(acc_over_time_pairs_post_tab, 
+          file = "acc_over_time_pairs_post_tab.csv", row.names = FALSE)
+```
+
+These tables summarize the pairwise results for time to decision and acceptance rates, with an extra column for the adjusted p-values. Separate tables are created for pairwise results within each time period and for evaluating the effect of time period on the pairs. 
+
+```{r}
+# Time to decision
+# Gender pairs within each time period
+time_pairs_prepost_gender_tab = cbind(
+  data.frame(time_pairs_prepost_gender_robust$contrasts), 
+  adj.p.value = all_pvals_adj[names(time_pairs_prepost_gender_pvals), "adj_pvals"])
+time_pairs_prepost_gender_tab$df = NULL
+time_pairs_prepost_gender_tab = time_pairs_prepost_gender_tab %>% 
+  mutate(time_periods = factor(case_when(
+    time_periods == "1" ~ "Pre-pandemic, before discontinuity", 
+    time_periods == "2" ~ "Pre-pandemic, after discontinuity", 
+    time_periods == "3" ~ "Pandemic"), 
+    levels = c("Pre-pandemic, before discontinuity", 
+               "Pre-pandemic, after discontinuity", "Pandemic"))
+  ) %>% 
+  arrange(time_periods)
+time_pairs_prepost_gender_tab[,3:5] = round(time_pairs_prepost_gender_tab[,3:5], 2)
+colnames(time_pairs_prepost_gender_tab) = 
+  c("Author Gender Pair Contrast", "Time Period", "Difference", 
+    "Std. Error", "t-Statistic", "p-value", "Adj. p-value")
+write.csv(time_pairs_prepost_gender_tab, 
+          file = "time_pairs_prepost_gender_tab.csv", row.names = FALSE)
+
+# Acceptance rate
+# Gender pairs within each time period
+acc_chance_pairs_prepost_gender_tab = cbind(
+  data.frame(acc_chance_pairs_prepost_gender_robust$contrasts), 
+  adj.p.value = all_pvals_adj[names(acc_chance_pairs_prepost_gender_pvals), "adj_pvals"])
+acc_chance_pairs_prepost_gender_tab$df = NULL
+acc_chance_pairs_prepost_gender_tab$null = NULL
+acc_chance_pairs_prepost_gender_tab = acc_chance_pairs_prepost_gender_tab %>% 
+  mutate(time_periods = factor(case_when(
+    time_periods == "1" ~ "Pre-pandemic, before discontinuity", 
+    time_periods == "2" ~ "Pre-pandemic, after discontinuity", 
+    time_periods == "3" ~ "Pandemic"), 
+    levels = c("Pre-pandemic, before discontinuity", 
+               "Pre-pandemic, after discontinuity", "Pandemic"))
+  ) %>% 
+  arrange(time_periods)
+acc_chance_pairs_prepost_gender_tab[,3:5] = round(acc_chance_pairs_prepost_gender_tab[,3:5], 2)
+colnames(acc_chance_pairs_prepost_gender_tab) = 
+  c("Author Gender Pair Contrast", "Time Period", "Odds Ratio", 
+    "Std. Error", "z-Statistic", "p-value", "Adj. p-value")
+write.csv(acc_chance_pairs_prepost_gender_tab, 
+          file = "acc_chance_pairs_prepost_gender_tab.csv", row.names = FALSE)
+```
+
+These tables summarize the results from the authorship pair contingency tables, with adjusted p-values. 
+
+```{r}
+# Pre-pandemic, before discontinuity
+authorship_pairs_pre_tab = data.frame(
+  Manuscripts = c("Submitted", rep("", 7), "Accepted", rep("", 7)), 
+  Dataset = rep(c("All", rep("", 3), "Unique", rep("", 3)), 2), 
+  rbind(
+    # Original submissions
+    sub_author_by_pair_original_pre, 
+    # Unique submissions
+    sub_author_by_pair_unique_pre, 
+    # Original acceptances
+    acc_author_by_pair_original_pre, 
+    # Unique acceptances
+    acc_author_by_pair_unique_pre), 
+  adj.p.value = all_pvals_adj[c(
+    # Original submissions
+    names(sub_author_by_pair_original_pre_pvals), 
+    # Unique submissions
+    names(sub_author_by_pair_unique_pre_pvals), 
+    # Original acceptances
+    names(acc_author_by_pair_original_pre_pvals), 
+    # Unique acceptances
+    names(acc_author_by_pair_unique_pre_pvals)), 
+    "adj_pvals"])
+authorship_pairs_pre_tab$df = NULL
+authorship_pairs_pre_tab$First = unlist(authorship_pairs_pre_tab$First)
+authorship_pairs_pre_tab$Last = unlist(authorship_pairs_pre_tab$Last)
+authorship_pairs_pre_tab$Observed = paste(
+  round(as.numeric(authorship_pairs_pre_tab$Observed)*100, 2), "%")
+authorship_pairs_pre_tab$Expected = paste(
+  round(as.numeric(authorship_pairs_pre_tab$Expected)*100, 2), "%")
+authorship_pairs_pre_tab$X.squared = round(as.numeric(authorship_pairs_pre_tab$X.squared), 2)
+authorship_pairs_pre_tab$pvalue = as.numeric(authorship_pairs_pre_tab$pvalue)
+
+colnames(authorship_pairs_pre_tab) = 
+  c("Manuscripts", "Dataset", "First Author", "Last Author",
+    "Observed", "Expected", "X2 Statistic", "p-value", "Adj. p-value")
+
+write.csv(authorship_pairs_pre_tab, 
+          file = "authorship_pairs_pre_tab.csv", row.names = FALSE)
+
+
+# Pre-pandemic, after discontinuity
+authorship_pairs_pre2_tab = data.frame(
+  Manuscripts = c("Submitted", rep("", 7), "Accepted", rep("", 7)), 
+  Dataset = rep(c("All", rep("", 3), "Unique", rep("", 3)), 2), 
+  rbind(
+    # Original submissions
+    sub_author_by_pair_original_pre2, 
+    # Unique submissions
+    sub_author_by_pair_unique_pre2, 
+    # Original acceptances
+    acc_author_by_pair_original_pre2, 
+    # Unique acceptances
+    acc_author_by_pair_unique_pre2), 
+  adj.p.value = all_pvals_adj[c(
+    # Original submissions
+    names(sub_author_by_pair_original_pre2_pvals), 
+    # Unique submissions
+    names(sub_author_by_pair_unique_pre2_pvals), 
+    # Original acceptances
+    names(acc_author_by_pair_original_pre2_pvals), 
+    # Unique acceptances
+    names(acc_author_by_pair_unique_pre2_pvals)), 
+    "adj_pvals"])
+authorship_pairs_pre2_tab$df = NULL
+authorship_pairs_pre2_tab$First = unlist(authorship_pairs_pre2_tab$First)
+authorship_pairs_pre2_tab$Last = unlist(authorship_pairs_pre2_tab$Last)
+authorship_pairs_pre2_tab$Observed = paste(
+  round(as.numeric(authorship_pairs_pre2_tab$Observed)*100, 2), "%")
+authorship_pairs_pre2_tab$Expected = paste(
+  round(as.numeric(authorship_pairs_pre2_tab$Expected)*100, 2), "%")
+authorship_pairs_pre2_tab$X.squared = round(as.numeric(authorship_pairs_pre2_tab$X.squared), 2)
+authorship_pairs_pre2_tab$pvalue = as.numeric(authorship_pairs_pre2_tab$pvalue)
+
+colnames(authorship_pairs_pre2_tab) = 
+  c("Manuscripts", "Dataset", "First Author", "Last Author",
+    "Observed", "Expected", "X2 Statistic", "p-value", "Adj. p-value")
+
+write.csv(authorship_pairs_pre2_tab, 
+          file = "authorship_pairs_pre2_tab.csv", row.names = FALSE)
+
+
+# Pandemic
+authorship_pairs_post_tab = data.frame(
+  Manuscripts = c("Submitted", rep("", 7), "Accepted", rep("", 7)), 
+  Dataset = rep(c("All", rep("", 3), "Unique", rep("", 3)), 2), 
+  rbind(
+    # Original submissions
+    sub_author_by_pair_original_post, 
+    # Unique submissions
+    sub_author_by_pair_unique_post, 
+    # Original acceptances
+    acc_author_by_pair_original_post, 
+    # Unique acceptances
+    acc_author_by_pair_unique_post), 
+  adj.p.value = all_pvals_adj[c(
+    # Original submissions
+    names(sub_author_by_pair_original_post_pvals), 
+    # Unique submissions
+    names(sub_author_by_pair_unique_post_pvals), 
+    # Original acceptances
+    names(acc_author_by_pair_original_post_pvals), 
+    # Unique acceptances
+    names(acc_author_by_pair_unique_post_pvals)), 
+    "adj_pvals"])
+authorship_pairs_post_tab$df = NULL
+authorship_pairs_post_tab$First = unlist(authorship_pairs_post_tab$First)
+authorship_pairs_post_tab$Last = unlist(authorship_pairs_post_tab$Last)
+authorship_pairs_post_tab$Observed = paste(
+  round(as.numeric(authorship_pairs_post_tab$Observed)*100, 2), "%")
+authorship_pairs_post_tab$Expected = paste(
+  round(as.numeric(authorship_pairs_post_tab$Expected)*100, 2), "%")
+authorship_pairs_post_tab$X.squared = round(as.numeric(authorship_pairs_post_tab$X.squared), 2)
+authorship_pairs_post_tab$pvalue = as.numeric(authorship_pairs_post_tab$pvalue)
+
+colnames(authorship_pairs_post_tab) = 
+  c("Manuscripts", "Dataset", "First Author", "Last Author",
+    "Observed", "Expected", "X2 Statistic", "p-value", "Adj. p-value")
+
+write.csv(authorship_pairs_post_tab, 
+          file = "authorship_pairs_post_tab.csv", row.names = FALSE)
+```
+
+# Pandemic-era submissions and acceptances by month
+
+```{r}
+# First authors
+df_original %>%
+  mutate(month_date = lubridate::floor_date(as_date(first_receipt_date), "month")) %>%
+  drop_na(first_author_gender) %>% 
+  filter(first_receipt_date >= as.Date("2020-03-01") & 
+           first_receipt_date < as.Date("2023-10-01")) %>% 
+  group_by(month_date, first_author_gender) %>%
+  summarise(submitted = sum(submitted), accepted = sum(accepted)) %>% 
+  ungroup() %>% 
+  pivot_longer(cols = -c("month_date", "first_author_gender")) %>% 
+  mutate(name = factor(ifelse(name == "submitted", "Submissions", "Acceptances"), 
+                       levels = c("Submissions", "Acceptances")), 
+         `First author gender` = factor(first_author_gender, 
+                                        levels = c("Woman", "Man"))) %>% 
+  ggplot(aes(x = month_date, y = value, col = `First author gender`)) + 
+  geom_point() + 
+  facet_wrap(~name, scales = "free_y") +
+  scale_x_date(minor_breaks = "1 year") + 
+  theme(panel.grid.major.x = element_line(),
+        panel.grid.minor.x = element_line()) + 
+  xlab("Date") + ylab("Average count per month")
+ggsave("pandemic_monthly_rates_first.png")
+
+# Last authors
+df_original %>%
+  mutate(month_date = lubridate::floor_date(as_date(first_receipt_date), "month")) %>%
+  drop_na(last_author_gender) %>% 
+  filter(first_receipt_date >= as.Date("2020-03-01") & 
+           first_receipt_date < as.Date("2023-10-01")) %>% 
+  group_by(month_date, last_author_gender) %>%
+  summarise(submitted = sum(submitted), accepted = sum(accepted)) %>% 
+  ungroup() %>% 
+  pivot_longer(cols = -c("month_date", "last_author_gender")) %>% 
+  mutate(name = factor(ifelse(name == "submitted", "Submissions", "Acceptances"), 
+                       levels = c("Submissions", "Acceptances")), 
+         `Last author gender` = factor(last_author_gender, 
+                                       levels = c("Woman", "Man"))) %>% 
+  ggplot(aes(x = month_date, y = value, col = `Last author gender`)) + 
+  geom_point() + 
+  facet_wrap(~name, scales = "free_y") +
+  scale_x_date(minor_breaks = "1 year") + 
+  theme(panel.grid.major.x = element_line(),
+        panel.grid.minor.x = element_line()) + 
+  xlab("Date") + ylab("Average count per month")
+ggsave("pandemic_monthly_rates_last.png")
+```
